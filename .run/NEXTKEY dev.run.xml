@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="NEXTKEY dev" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="pleos.nextkey.NextkeyApplication" />
+    <module name="NEXTKEY.main" />
+    <envs>
+      <env name="SPRING_PROFILES_ACTIVE" value="dev" />
+    </envs>
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <method v="2"><option name="Make" enabled="true" /></method>
+  </configuration>
+</component>
