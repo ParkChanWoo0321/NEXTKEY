@@ -1,5 +1,6 @@
 package pleos.nextkey.core;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -11,6 +12,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import pleos.nextkey.common.Json;
 import static pleos.nextkey.core.CoreData.*;
 
 @Component
@@ -57,6 +59,18 @@ class DemoData implements SmartInitializingSingleton {
             } else if (cloudRun && !encoder.matches(password, (String) existing.get("password_hash"))) {
                 throw new IllegalStateException("Stored credential differs from the configured Cloud Run credential for " + key);
             }
+        }
+        for (String id: new String[]{"demo-car","demo-car-2"}) {
+            if (first(db,"SELECT id FROM vehicle WHERE id=? FOR UPDATE",id).isEmpty())
+                db.update("INSERT INTO vehicle(id,model,energy_type,compatibility_key) VALUES (?,'VIRTUAL-EV','BATTERY','DEMO-EV')",id);
+        }
+        if (first(db,"SELECT id FROM reservation WHERE id='demo-reservation' FOR UPDATE").isEmpty()) {
+            Instant now=Instant.now();
+            String place=Json.write(Map.of("name","가상 시연 반납 지점","address","시연 주소","coordinateStatus","UNKNOWN"));
+            db.update("""
+                INSERT INTO reservation(id,account_id,vehicle_id,status,starts_at,confirmed_end_at,return_json)
+                VALUES ('demo-reservation','demo-customer','demo-car','CONFIRMED',?,?,?)
+                """,sql(now.minusSeconds(3600)),sql(now.plusSeconds(86400)),place);
         }
     }
 }
