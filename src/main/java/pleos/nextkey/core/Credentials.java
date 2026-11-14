@@ -1,6 +1,7 @@
 package pleos.nextkey.core;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -58,14 +59,27 @@ class Credentials {
     }
 
     Actor identify(String token, String path, String method) {
-        if (token.length() != 43) return null;
-        var row = first(db, """
-            SELECT a.id, a.role FROM auth_token t
+        if (token.length()!=43) return null;
+        var row=first(db,"""
+            SELECT a.id,a.role,t.session_id,s.state,s.cleanup_state FROM auth_token t
             JOIN account a ON a.id=t.account_id AND a.enabled=TRUE
-            WHERE t.token_hash=? AND t.session_id IS NULL AND t.expires_at>UTC_TIMESTAMP(6)
-              AND t.dev_issued=? AND (? OR a.is_demo=FALSE)
-            """, hash(token), allowDemo, allowDemo);
+            LEFT JOIN rental_session s ON s.id=t.session_id
+            WHERE t.token_hash=? AND t.expires_at>UTC_TIMESTAMP(6) AND t.dev_issued=? AND (? OR a.is_demo=FALSE)
+              AND (s.id IS NULL OR EXISTS (SELECT 1 FROM account c WHERE c.id=s.account_id AND c.enabled=TRUE
+                AND (? OR c.is_demo=FALSE)))
+            """,hash(token),allowDemo,allowDemo,allowDemo);
         if (row.isEmpty()) return null;
-        return new Actor(string(row, "id"), string(row, "role"));
+        String sid=string(row,"session_id");
+        if (sid==null) return new Actor(string(row,"id"),string(row,"role"));
+        if ("ENDED".equals(row.get("state"))) {
+            String base="/api/sessions/"+sid;
+            boolean cleaned="COMPLETE".equals(row.get("cleanup_state"));
+            boolean cleanupAck=method.equals("POST") && path.equals(base+"/cleanup/ack");
+            boolean allowed=!cleaned && ((method.equals("POST") && List.of("/end","/end/ack","/events").stream()
+                    .anyMatch(suffix->path.equals(base+suffix))) || (method.equals("GET")
+                    && (path.equals(base+"/cleanup") || path.equals("/api/vehicle/recovery"))));
+            if (!cleanupAck && !allowed) return null;
+        }
+        return new Actor(sid,"SESSION");
     }
 }
