@@ -1,12 +1,15 @@
 package pleos.nextkey.records;
 
 import static pleos.nextkey.records.RecordData.require;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.util.*;
 import java.util.function.Supplier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
+import pleos.nextkey.common.ApiError;
 import pleos.nextkey.common.Json;
 
 @Service
@@ -17,6 +20,12 @@ class RecordRequests {
     private static String hash(byte[] bytes) {
         try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)); }
         catch (NoSuchAlgorithmException ex) { throw new IllegalStateException(ex); }
+    }
+
+    String photoHash(MultipartFile file) {
+        require(file!=null && file.getSize()<=data.env.getProperty("nextkey.damage.max-bytes",Long.class,2_000_000L),413,"PHOTO_SIZE");
+        try { return hash(file.getBytes()); }
+        catch (IOException ex) { throw new ApiError(400,"PHOTO_UNREADABLE"); }
     }
 
     @Transactional
