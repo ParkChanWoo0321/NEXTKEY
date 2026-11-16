@@ -1,8 +1,7 @@
 package pleos.nextkey.core;
 
 import java.time.Instant;
-import java.util.List;
-import java.util.Map;
+import java.util.Set;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -71,15 +70,23 @@ class Credentials {
         if (row.isEmpty()) return null;
         String sid=string(row,"session_id");
         if (sid==null) return new Actor(string(row,"id"),string(row,"role"));
-        if ("ENDED".equals(row.get("state"))) {
-            String base="/api/sessions/"+sid;
-            boolean cleaned="COMPLETE".equals(row.get("cleanup_state"));
-            boolean cleanupAck=method.equals("POST") && path.equals(base+"/cleanup/ack");
-            boolean allowed=!cleaned && ((method.equals("POST") && List.of("/end","/end/ack","/events").stream()
-                    .anyMatch(suffix->path.equals(base+suffix))) || (method.equals("GET")
-                    && (path.equals(base+"/cleanup") || path.equals(base+"/contract-status") || path.equals("/api/vehicle/recovery"))));
-            if (!cleanupAck && !allowed) return null;
-        }
+        if ("ENDED".equals(row.get("state"))
+                && !allowedAfterEnd(sid,path,method,"COMPLETE".equals(row.get("cleanup_state")))) return null;
         return new Actor(sid,"SESSION");
+    }
+
+    private boolean allowedAfterEnd(String sid,String path,String method,boolean cleaned) {
+        String prefix="/api/sessions/"+sid+"/";
+        if ("POST".equals(method) && path.equals(prefix+"cleanup/ack")) return true;
+        if (cleaned) return false;
+        if ("GET".equals(method) && Set.of("/api/vehicle/recovery","/api/support").contains(path)) return true;
+        if (!path.startsWith(prefix)) return false;
+        String action=path.substring(prefix.length());
+        return switch (method) {
+            case "GET" -> Set.of("cleanup","state","support","contract-status","settings/applications").contains(action)
+                    || action.matches("settings/applications/[^/]+");
+            case "POST" -> Set.of("end","end/ack","events","report/retry").contains(action);
+            default -> false;
+        };
     }
 }

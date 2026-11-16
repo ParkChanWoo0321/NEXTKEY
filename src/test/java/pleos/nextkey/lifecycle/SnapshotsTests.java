@@ -32,4 +32,12 @@ class SnapshotsTests {
     @Test void simulatedReadingsMustBeDevOnly() {
         assertThrows(ApiError.class,()->Snapshots.assertSourcesAllowed(Map.of("battery",Map.of("source","DEV_SIMULATOR")),false));
     }
+    @Test void warningComparisonRequiresComparableReadingsAndDoesNotInventNewWarnings() {
+        var start=Snapshots.normalize(Map.of("warnings",Map.of("codes",java.util.List.of("WASHER_LOW"),
+                "source","DEV_SIMULATOR","status","VALID","collectedAt",now.minusSeconds(30).toString())),"BATTERY",now);
+        var end=Snapshots.normalize(Map.of("warnings",Map.of("codes",java.util.List.of("WASHER_LOW","BRAKE_LOW","BRAKE_LOW"),
+                "source","DEV_SIMULATOR","status","VALID","collectedAt",now.toString())),"BATTERY",now);
+        assertEquals(java.util.List.of("BRAKE_LOW"),Snapshots.warningDifference(start,end).get("newCodes"));
+        assertEquals("UNCONFIRMED",Snapshots.warningDifference(start,Snapshots.normalize(null,"BATTERY",now)).get("status"));
+    }
 }
