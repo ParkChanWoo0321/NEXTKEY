@@ -1,6 +1,7 @@
 package pleos.nextkey.core;
 
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,11 +66,61 @@ class BookingService {
         return create(actor,request,null);
     }
 
+    @Transactional(isolation=org.springframework.transaction.annotation.Isolation.READ_COMMITTED)
+    public ReservationView replacement(Actor actor,String oldSessionId,ReservationView request){
+        actor.require("OPERATOR");
+        var normalized=normalizedRequest(request);
+        String legacyDigest=replacementDigest(request);
+        request=normalized;
+        String digest=replacementDigest(request);
+        availability.lock(request.accountId(),request.vehicleId());
+        var old=first(db,"SELECT * FROM rental_session WHERE id=? FOR UPDATE",oldSessionId);
+        if (old.isEmpty()) throw fail(404,"SESSION_NOT_FOUND");
+        if (old.get("account_id").equals(request.accountId()) && old.get("vehicle_id").equals(request.vehicleId()))
+            throw fail(422,"REPLACEMENT_REQUIRES_CHANGE");
+        var existing=first(db,"SELECT * FROM session_replacement WHERE old_session_id=? FOR UPDATE",oldSessionId);
+        if (!existing.isEmpty()) {
+            if (digest.equals(existing.get("preparation_digest")) || legacyDigest.equals(existing.get("preparation_digest")))
+                return preparedResult(existing.get("preparation_result"));
+            throw fail(409,"REPLACEMENT_CONFLICT");
+        }
+        var next=create(actor,request,string(old,"reservation_id"));
+        db.update("""
+            INSERT INTO session_replacement(new_reservation_id,old_session_id,status,requested_by,requested_at,
+                preparation_digest,preparation_result)
+            VALUES (?,?,'PENDING',?,UTC_TIMESTAMP(6),?,?)
+            """,next.id(),oldSessionId,actor.id(),digest,Json.write(preparedSnapshot(next)));
+        return next;
+    }
+
+    // The old session admits one replacement. Its normalized request is the retry key, while the
+    // immutable response survives later reservation edits and a lost first HTTP response.
+    private static String replacementDigest(ReservationView request) {
+        var canonical=new LinkedHashMap<String,Object>();
+        canonical.put("accountId",request.accountId());
+        canonical.put("vehicleId",request.vehicleId());
+        canonical.put("startsAt",request.startsAt().toString());
+        canonical.put("confirmedEndAt",request.confirmedEndAt().toString());
+        canonical.put("destination",clean(request.destination()));
+        canonical.put("returnPlace",clean(request.returnPlace()));
+        return hash(Json.write(canonical));
+    }
+    private static Map<String,Object> preparedSnapshot(ReservationView result) {
+        return Map.of("id",result.id(),"accountId",result.accountId(),"vehicleId",result.vehicleId(),"status",result.status(),
+                "startsAt",result.startsAt().toString(),"confirmedEndAt",result.confirmedEndAt().toString(),
+                "destination",result.destination(),"returnPlace",result.returnPlace());
+    }
+    private ReservationView preparedResult(Object stored) {
+        var result=json(stored);
+        return new ReservationView((String)result.get("id"),(String)result.get("accountId"),(String)result.get("vehicleId"),
+                (String)result.get("status"),Instant.parse((String)result.get("startsAt")),
+                Instant.parse((String)result.get("confirmedEndAt")),fromJson(Json.write(result.get("destination"))),
+                fromJson(Json.write(result.get("returnPlace"))));
+    }
+
     private ReservationView create(Actor actor,ReservationView request,String replacing){
         actor.require("OPERATOR","CUSTOMER");
-        if(request==null || !validId(request.accountId()) || !validId(request.vehicleId()) ||
-            request.startsAt()==null || request.confirmedEndAt()==null || !request.confirmedEndAt().isAfter(request.startsAt()))
-            throw fail(400,"INVALID_RESERVATION");
+        request=normalizedRequest(request);
         if("CUSTOMER".equals(actor.role()) && !actor.id().equals(request.accountId())) throw fail(403,"RESERVATION_FORBIDDEN");
         availability.lock(request.accountId(),request.vehicleId());
         availability.requireAvailable(request.accountId(),request.vehicleId(),request.startsAt(),request.confirmedEndAt(),null,replacing);
@@ -84,6 +135,17 @@ class BookingService {
             """,accepted.id(),accepted.accountId(),accepted.vehicleId(),accepted.status(),sql(accepted.startsAt()),
             sql(accepted.confirmedEndAt()),Json.write(accepted.destination()),Json.write(accepted.returnPlace()));
         return accepted;
+    }
+
+    private static ReservationView normalizedRequest(ReservationView request) {
+        if (request==null || !validId(request.accountId()) || !validId(request.vehicleId()) ||
+                request.startsAt()==null || request.confirmedEndAt()==null)
+            throw fail(400,"INVALID_RESERVATION");
+        Instant startsAt=request.startsAt().truncatedTo(ChronoUnit.MICROS);
+        Instant confirmedEndAt=request.confirmedEndAt().truncatedTo(ChronoUnit.MICROS);
+        if (!confirmedEndAt.isAfter(startsAt)) throw fail(400,"INVALID_RESERVATION");
+        return new ReservationView(request.id(),request.accountId(),request.vehicleId(),request.status(),
+                startsAt,confirmedEndAt,request.destination(),request.returnPlace());
     }
 
     @Transactional(isolation=org.springframework.transaction.annotation.Isolation.READ_COMMITTED)
@@ -107,16 +169,23 @@ class BookingService {
     }
     private ReservationView checked(ReservationView old,ReservationView v){
         if (v==null || !old.id().equals(v.id()) || !old.accountId().equals(v.accountId()) || !old.vehicleId().equals(v.vehicleId())
-            || !List.of("CONFIRMED","CANCELLED").contains(v.status()) || v.startsAt()==null || v.confirmedEndAt()==null
-            || !v.confirmedEndAt().isAfter(v.startsAt())) throw fail(503,"INVALID_PROVIDER_RESERVATION");
-        return new ReservationView(v.id(),v.accountId(),v.vehicleId(),v.status(),v.startsAt(),v.confirmedEndAt(),
+            || !List.of("CONFIRMED","CANCELLED").contains(v.status()) || v.startsAt()==null || v.confirmedEndAt()==null)
+            throw fail(503,"INVALID_PROVIDER_RESERVATION");
+        Instant startsAt=v.startsAt().truncatedTo(ChronoUnit.MICROS);
+        Instant confirmedEndAt=v.confirmedEndAt().truncatedTo(ChronoUnit.MICROS);
+        if (!confirmedEndAt.isAfter(startsAt)) throw fail(503,"INVALID_PROVIDER_RESERVATION");
+        return new ReservationView(v.id(),v.accountId(),v.vehicleId(),v.status(),startsAt,confirmedEndAt,
                 clean(v.destination()),clean(v.returnPlace()));
     }
     private void persist(ReservationView old,ReservationView r){
         if ("CONFIRMED".equals(r.status()) && (!old.startsAt().equals(r.startsAt()) ||
                 !old.confirmedEndAt().equals(r.confirmedEndAt()) || !old.status().equals(r.status()))) {
-            availability.requireAvailable(r.accountId(),r.vehicleId(),r.startsAt(),r.confirmedEndAt(),
-                    r.id(),null);
+            var replacement=first(db,"""
+                SELECT s.reservation_id FROM session_replacement p
+                JOIN rental_session s ON s.id=p.old_session_id WHERE p.new_reservation_id=?
+                """,r.id());
+            availability.requireAvailable(r.accountId(),r.vehicleId(),r.startsAt(),r.confirmedEndAt(),r.id(),
+                    string(replacement,"reservation_id"));
         }
         db.update("UPDATE reservation SET status=?,starts_at=?,confirmed_end_at=?,destination_json=?,return_json=? WHERE id=?",
                 r.status(),sql(r.startsAt()),sql(r.confirmedEndAt()),Json.write(r.destination()),Json.write(r.returnPlace()),r.id());

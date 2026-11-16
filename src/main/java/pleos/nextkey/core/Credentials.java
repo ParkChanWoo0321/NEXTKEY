@@ -77,7 +77,7 @@ class Credentials {
             boolean cleanupAck=method.equals("POST") && path.equals(base+"/cleanup/ack");
             boolean allowed=!cleaned && ((method.equals("POST") && List.of("/end","/end/ack","/events").stream()
                     .anyMatch(suffix->path.equals(base+suffix))) || (method.equals("GET")
-                    && (path.equals(base+"/cleanup") || path.equals("/api/vehicle/recovery"))));
+                    && (path.equals(base+"/cleanup") || path.equals(base+"/contract-status") || path.equals("/api/vehicle/recovery"))));
             if (!cleanupAck && !allowed) return null;
         }
         return new Actor(sid,"SESSION");
