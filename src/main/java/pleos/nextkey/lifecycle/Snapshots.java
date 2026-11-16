@@ -89,4 +89,19 @@ public final class Snapshots {
         // Energy is signed end minus start (charging/refuelling is possible). It is not consumption.
         return Map.of("status", "VALID", "unit", "odometer".equals(field) ? "km" : "%p", "value", diff);
     }
+
+    static Map<String,Object> warningDifference(Map<String,Object> start,Map<String,Object> end) {
+        if (!(start.get("warnings") instanceof Map<?,?> first) || !(end.get("warnings") instanceof Map<?,?> last)
+                || !"VALID".equals(first.get("status")) || !"VALID".equals(last.get("status"))
+                || !(first.get("codes") instanceof List<?> before) || !(last.get("codes") instanceof List<?> after)) {
+            return Map.of("status","UNCONFIRMED");
+        }
+        Instant a=instant(first.get("collectedAt")),b=instant(last.get("collectedAt"));
+        if (a==null || b==null || b.isBefore(a)) return Map.of("status","TIME_REVERSED");
+        if (!Objects.equals(first.get("source"),last.get("source"))) return Map.of("status","SOURCE_CHANGED");
+        var previous=new LinkedHashSet<>(before);
+        var current=new LinkedHashSet<>(after);
+        return Map.of("status","VALID","startCodes",List.copyOf(previous),"endCodes",List.copyOf(current),
+                "newCodes",current.stream().filter(code->!previous.contains(code)).toList());
+    }
 }

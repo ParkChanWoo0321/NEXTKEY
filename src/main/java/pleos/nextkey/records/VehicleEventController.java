@@ -10,10 +10,12 @@ import pleos.nextkey.common.Actor;
 class VehicleEventController {
     private final Access access;
     private final VehicleEvents events;
+    private final RecordRequests requests;
 
-    VehicleEventController(Access access, VehicleEvents events) {
+    VehicleEventController(Access access, VehicleEvents events, RecordRequests requests) {
         this.access = access;
         this.events = events;
+        this.requests = requests;
     }
 
     private void authorize(String session, String... roles) {
@@ -29,9 +31,12 @@ class VehicleEventController {
     }
 
     @PutMapping("/sessions/{id}/location/consent")
-    Map<String,Object> consent(@PathVariable String id,@RequestBody VehicleEvents.Consent input) {
-        authorize(id,"CUSTOMER");
-        return events.consent(id,input);
+    Map<String,Object> consent(@PathVariable String id,@RequestBody VehicleEvents.Consent input,
+                              @RequestHeader(value="Idempotency-Key",required=false) String key) {
+        authorize(id,"CUSTOMER","SESSION");
+        requests.once(id,"LOCATION_CONSENT",key,input,()->events.consent(id,input));
+        // An earlier grant replay must report a later withdrawal, not a stale successful-grant response.
+        return events.consentState(id);
     }
 
     @GetMapping("/sessions/{id}/location/consent")
