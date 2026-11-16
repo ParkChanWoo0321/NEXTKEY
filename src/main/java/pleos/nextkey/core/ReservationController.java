@@ -28,6 +28,11 @@ class ReservationController {
         return bookings.create(actor, input);
     }
 
+    @PostMapping("/operator/sessions/{oldSessionId}/replacement-reservations")
+    Object replacementReservation(@PathVariable String oldSessionId,@RequestBody ReservationView r) {
+        return bookings.replacement(Actor.current(),oldSessionId,r);
+    }
+
     @PostMapping("/reservations")
     Object create(@RequestBody ReservationView input) {
         Actor actor = Actor.current();

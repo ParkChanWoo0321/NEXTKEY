@@ -152,6 +152,8 @@ class ChallengeService {
             Instant now=Instant.now();
             if(now.isBefore(r.startsAt())) throw fail(409,"BOARDING_TOO_EARLY");
             if(!now.isBefore(r.confirmedEndAt())) throw fail(409,"RESERVATION_EXPIRED");
+            if (!first(db,"SELECT old_session_id FROM session_replacement WHERE new_reservation_id=? AND status<>'APPROVED' FOR UPDATE",r.id()).isEmpty())
+                throw fail(409,"REPLACEMENT_PENDING");
             if (!first(db,"SELECT id FROM rental_session WHERE occupied_vehicle=? OR occupied_account=? FOR UPDATE",r.vehicleId(),r.accountId()).isEmpty())
                 throw fail(409,"PREVIOUS_SESSION_REQUIRES_CLEANUP");
             var snapshot=json(c.get("start_input"));
