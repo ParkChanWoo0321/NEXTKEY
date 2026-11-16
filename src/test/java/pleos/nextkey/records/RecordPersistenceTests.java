@@ -23,9 +23,11 @@ import pleos.nextkey.common.Json;
 @Transactional
 class RecordPersistenceTests {
     @Autowired RecordData data;
+    @Autowired VehicleEvents events;
     @Autowired DamageRecords damage;
     @Autowired RecordRequests requests;
     @Autowired PersonalSettings settings;
+    @Autowired RentalRecords records;
     String id;
     String car;
 
@@ -39,6 +41,46 @@ class RecordPersistenceTests {
             "VALUES(?,?,?,'CONFIRMED',UTC_TIMESTAMP()-INTERVAL 1 HOUR, UTC_TIMESTAMP()+INTERVAL 1 HOUR)",booking,customer,car);
         data.db.update("INSERT INTO rental_session(id,reservation_id,account_id,vehicle_id,state,started_at,start_json) " +
             "VALUES(?,?,?,?,'ACTIVE',UTC_TIMESTAMP()-INTERVAL 30 MINUTE,JSON_OBJECT())",id,booking,customer,car);
+    }
+
+    VehicleEvents.Input point(String event,String consent,Instant collected,Instant fix, int accuracy) {
+        return new VehicleEvents.Input(event,"LOCATION",collected,"DEV_SIMULATOR",null,null,null,null,null,consent,
+            true,true,fix,BigDecimal.valueOf(36.6),BigDecimal.valueOf(126.5),BigDecimal.valueOf(accuracy));
+    }
+
+    @Test void revokedAndStaleLocationsLeaveNoCoordinatesAndRegrantStartsNewSegment() {
+        String first=(String)((Map<?,?>)events.consent(id,new VehicleEvents.Consent(true,"v1")).get("latest")).get("id");
+        Instant firstAt=Instant.now();
+        var sample=point(RecordData.uuid(),first,firstAt,firstAt,12);
+        assertEquals("VALID",events.accept(id,sample).get("status"));
+        assertEquals(true,events.accept(id,sample).get("replayed"));
+        events.consent(id,new VehicleEvents.Consent(false,"v1"));
+        var denied=point(RecordData.uuid(),first,Instant.now(),firstAt,12);
+        assertEquals("NO_CURRENT_GRANT",events.accept(id,denied).get("status"));
+        assertEquals("{}",data.db.queryForObject("SELECT payload FROM vehicle_event WHERE id=?",String.class,denied.eventId()));
+        String next=(String)((Map<?,?>)events.consent(id,new VehicleEvents.Consent(true,"v1")).get("latest")).get("id");
+        var stale=point(RecordData.uuid(),next,Instant.now(),firstAt.minusSeconds(60),12);
+        assertEquals("STALE_FIX",events.accept(id,stale).get("status"));
+        Instant after=Instant.now();
+        assertEquals("VALID",events.accept(id,point(RecordData.uuid(),next,after,after,12)).get("status"));
+        var route=events.route(events.timeline(id));
+        assertEquals(2,((List<?>)route.get("segments")).size());
+        assertEquals(2,((List<?>)route.get("gaps")).size());
+        assertTrue(records.accepted(id,List.of(sample.eventId(),denied.eventId())));
+        assertFalse(records.accepted(id,List.of(RecordData.uuid())));
+    }
+
+    @Test void delayedEnergyDoesNotReplaceNewerReadingAndUnitMismatchIsUnknown() {
+        Instant now=Instant.now();
+        var newest=new VehicleEvents.Input(RecordData.uuid(),"MEASUREMENT",now,"DEV_SIMULATOR","BATTERY",
+            BigDecimal.valueOf(15),"kWh",null,null,null,null,null,null,null,null,null);
+        var older=new VehicleEvents.Input(RecordData.uuid(),"MEASUREMENT",now.minusSeconds(10),"DEV_SIMULATOR","BATTERY",
+            BigDecimal.valueOf(70),"%",null,null,null,null,null,null,null,null,null);
+        events.accept(id,newest);
+        events.accept(id,older);
+        var energy=records.latestEnergy(id);
+        assertEquals("UNIT_MISMATCH",energy.get("status"));
+        assertNull(energy.get("value"));
     }
 
     @Test void profileReadbackReportsPartialFailureAndOnlyStoresSupportedSettings() {
