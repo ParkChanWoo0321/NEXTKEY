@@ -1,6 +1,7 @@
 package pleos.nextkey.core;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.springframework.beans.factory.annotation.Value;
@@ -15,6 +16,8 @@ import static pleos.nextkey.core.CoreData.*;
 
 @Service
 class ChallengeService {
+    private static final int FACTOR_ATTEMPT_LIMIT=3;
+    private static final long FACTOR_LOCK_SECONDS=15;
     private final JdbcTemplate db;
     private final BookingService bookings;
     private final Credentials credentials;
@@ -23,7 +26,7 @@ class ChallengeService {
     private final long factorSeconds;
     private final boolean allowDemo;
     ChallengeService(JdbcTemplate db,BookingService bookings,Credentials credentials,IdentityFactor factor,
-            @Value("${nextkey.auth.challenge-seconds:180}") long challengeSeconds,
+            @Value("${nextkey.auth.challenge-seconds:60}") long challengeSeconds,
             @Value("${nextkey.auth.factor-seconds:120}") long factorSeconds,
             org.springframework.core.env.Environment env) {
         this.db=db;this.bookings=bookings;this.credentials=credentials;this.factor=factor;
@@ -47,8 +50,8 @@ class ChallengeService {
         var normalized=Snapshots.normalize(input,string(vehicle,"energy_type"),now);
         db.update("UPDATE auth_challenge SET status='SUPERSEDED' WHERE vehicle_id=? AND status IN ('OPEN','SECOND_FACTOR','VERIFIED')",actor.id());
         db.update("""
-            DELETE t FROM auth_token t JOIN rental_session s ON s.id=t.session_id
-            WHERE s.vehicle_id=? AND s.cleanup_state<>'COMPLETE'
+            DELETE FROM auth_token WHERE session_id IN (
+                SELECT id FROM rental_session WHERE vehicle_id=? AND cleanup_state<>'COMPLETE')
             """,actor.id());
         db.update("""
             INSERT INTO auth_challenge(id,vehicle_id,method,qr_hash,poll_hash,expires_at,status,start_input,dev_issued)
@@ -56,6 +59,7 @@ class ChallengeService {
             """,id,actor.id(),method,qr==null?null:hash(qr),hash(poll),sql(now.plusSeconds(challengeSeconds)),Json.write(normalized),allowDemo);
         Map<String,Object> result=new LinkedHashMap<>();
         result.put("id",id);result.put("pollSecret",poll);result.put("expiresAt",now.plusSeconds(challengeSeconds));
+        result.put("serverTime",now);
         if (qr!=null) result.put("qrToken",qr);
         return result;
     }
@@ -76,17 +80,17 @@ class ChallengeService {
         if (!instant(c.get("expires_at")).isAfter(Instant.now())) throw fail(410,"QR".equals(method)?"QR_EXPIRED":"CHALLENGE_EXPIRED");
     }
 
-    @Transactional
+    @Transactional(noRollbackFor=ApiError.class)
     public Map<String,Object> qr(String id,Actor actor,String token,String reservationId){
         actor.require("CUSTOMER");
-        lockCustomer(actor.id());
+        var account=lockCustomer(actor.id());
         var c=lockChallenge(id);
         if(!matches(token,string(c,"qr_hash"))) throw fail(401,"INVALID_QR");
         requireOpen(c,"QR");
-        return bind(c,actor,reservationId);
+        return bind(c,actor,reservationId,account);
     }
 
-    @Transactional
+    @Transactional(noRollbackFor=ApiError.class)
     public Map<String,Object> direct(String id,Actor device,String username,String password,String reservationId){
         device.require("VEHICLE");
         var ref=first(db,"SELECT * FROM auth_challenge WHERE id=? AND dev_issued=?",id,allowDemo);
@@ -95,27 +99,63 @@ class ChallengeService {
         requireOpen(ref,"DIRECT");
         Actor customer=credentials.authenticate(username,password);
         customer.require("CUSTOMER");
-        lockCustomer(customer.id());
+        var account=lockCustomer(customer.id());
         var c=lockChallenge(id);
         if (!device.id().equals(c.get("vehicle_id"))) throw fail(403,"DEVICE_MISMATCH");
         requireOpen(c,"DIRECT");
-        return bind(c,customer,reservationId);
+        return bind(c,customer,reservationId,account);
     }
 
-    private Map<String,Object> bind(Map<String,Object> c,Actor customer,String reservationId){
+    private Map<String,Object> bind(Map<String,Object> c,Actor customer,String reservationId,Map<String,Object> account){
         if (!BookingService.validId(reservationId)) throw fail(400,"RESERVATION_ID_REQUIRED");
+        Instant now=Instant.now();
+        int attempts=availableFactorAttempts(account,now);
         String id=string(c,"id");
         factor.begin(customer.id(),id);
-        Instant expiry=Instant.now().plusSeconds(factorSeconds);
+        Instant issuedAt=Instant.now();
+        Instant expiry=issuedAt.plusSeconds(factorSeconds);
         db.update("UPDATE auth_challenge SET status='SECOND_FACTOR',account_id=?,reservation_id=?,second_expires_at=? WHERE id=?",
                 customer.id(),reservationId,sql(expiry),id);
-        return Map.of("state","SECOND_FACTOR_REQUIRED","expiresAt",expiry);
+        return Map.of("state","SECOND_FACTOR_REQUIRED","expiresAt",expiry,"serverTime",issuedAt,
+                "attemptLimit",FACTOR_ATTEMPT_LIMIT,"remainingAttempts",FACTOR_ATTEMPT_LIMIT-attempts,
+                "lockSeconds",FACTOR_LOCK_SECONDS);
     }
 
     private Map<String,Object> lockCustomer(String account){
         var a=first(db,"SELECT * FROM account WHERE id=? AND enabled=TRUE AND role='CUSTOMER' FOR UPDATE",account);
         if(a.isEmpty()) throw fail(403,"ACCOUNT_DISABLED");
         return a;
+    }
+
+    /** Caller holds the account lock, so a new challenge cannot bypass the shared limit. */
+    private int availableFactorAttempts(Map<String,Object> account,Instant now) {
+        Instant until=account.get("factor_blocked_until")==null ? null : instant(account.get("factor_blocked_until"));
+        if(until!=null && until.isAfter(now)) throw factorLimit(until,now);
+        String id=string(account,"id");
+        if(until!=null) {
+            db.update("UPDATE account SET factor_attempts=0,factor_blocked_until=NULL WHERE id=?",id);
+            db.update("UPDATE auth_challenge SET attempt_count=0 WHERE account_id=? AND status='SECOND_FACTOR'",id);
+            return 0;
+        }
+        int attempts=((Number)account.get("factor_attempts")).intValue();
+        if(attempts>=FACTOR_ATTEMPT_LIMIT) {
+            // Also bring an in-flight counter created under an older policy into this limit.
+            Instant retryAt=now.plusSeconds(FACTOR_LOCK_SECONDS);
+            db.update("UPDATE account SET factor_blocked_until=? WHERE id=?",sql(retryAt),id);
+            throw factorLimit(retryAt,now);
+        }
+        return attempts;
+    }
+
+    private ApiError factorLimit(Instant retryAt,Instant now) {
+        long seconds=Math.max(1,(Duration.between(now,retryAt).toMillis()+999)/1000);
+        return new ApiError(429,"SECOND_FACTOR_ATTEMPT_LIMIT",Map.of(
+                "attemptLimit",FACTOR_ATTEMPT_LIMIT,"remainingAttempts",0,"lockSeconds",FACTOR_LOCK_SECONDS,
+                "retryAt",retryAt.toString(),"retryAfterSeconds",seconds,"serverTime",now.toString()));
+    }
+
+    private ApiError beforeStart(Instant startsAt,Instant now) {
+        return new ApiError(409,"BOARDING_TOO_EARLY",Map.of("availableAt",startsAt.toString(),"serverTime",now.toString()));
     }
 
     @Transactional(noRollbackFor=ApiError.class,isolation=org.springframework.transaction.annotation.Isolation.READ_COMMITTED)
@@ -129,17 +169,20 @@ class ChallengeService {
         actor.require(qr?"CUSTOMER":"VEHICLE");
         if (!actor.id().equals(c.get(qr?"account_id":"vehicle_id"))) throw fail(403,"CHALLENGE_FORBIDDEN");
         if (!"SECOND_FACTOR".equals(c.get("status"))) throw fail(409,"CHALLENGE_ALREADY_USED");
-        if(!instant(c.get("second_expires_at")).isAfter(Instant.now())) throw fail(410,"SECOND_FACTOR_EXPIRED");
+        Instant checkedAt=Instant.now();
+        int attempts=availableFactorAttempts(a,checkedAt);
+        if(!instant(c.get("second_expires_at")).isAfter(checkedAt)) throw fail(410,"SECOND_FACTOR_EXPIRED");
         String account=string(c,"account_id");
-        int attempts=((Number)c.get("attempt_count")).intValue();
-        var blocked=a.get("factor_blocked_until");
-        if(attempts>=5 || (blocked!=null && instant(blocked).isAfter(Instant.now()))) throw fail(429,"SECOND_FACTOR_ATTEMPT_LIMIT");
         if (!factor.verify(account,id,code)) {
-            int global=blocked==null ? ((Number)a.get("factor_attempts")).intValue()+1 : 1;
+            int global=attempts+1;
+            Instant failedAt=Instant.now();
+            Instant retryAt=global>=FACTOR_ATTEMPT_LIMIT ? failedAt.plusSeconds(FACTOR_LOCK_SECONDS) : null;
             db.update("UPDATE account SET factor_attempts=?,factor_blocked_until=? WHERE id=?",global,
-                    global>=5?sql(Instant.now().plusSeconds(300)):null,account);
+                    retryAt==null?null:sql(retryAt),account);
             db.update("UPDATE auth_challenge SET attempt_count=attempt_count+1 WHERE id=?",id);
-            throw fail(attempts+1>=5 || global>=5 ?429:401,attempts+1>=5 || global>=5?"SECOND_FACTOR_ATTEMPT_LIMIT":"SECOND_FACTOR_INVALID");
+            if(retryAt!=null) throw factorLimit(retryAt,failedAt);
+            throw new ApiError(401,"SECOND_FACTOR_INVALID",Map.of("attemptLimit",FACTOR_ATTEMPT_LIMIT,
+                    "remainingAttempts",FACTOR_ATTEMPT_LIMIT-global,"lockSeconds",FACTOR_LOCK_SECONDS));
         }
         var r=bookings.lookup(string(c,"reservation_id"),true);
         if (!account.equals(r.accountId())) throw fail(403,"RESERVATION_FORBIDDEN");
@@ -147,12 +190,13 @@ class ChallengeService {
         r=bookings.refresh(r);
         if ("CANCELLED".equals(r.status())) throw fail(409,"RESERVATION_CANCELLED");
         var session=first(db,"SELECT * FROM rental_session WHERE reservation_id=? FOR UPDATE",r.id());
+        Instant now=Instant.now();
+        if((session.isEmpty() || "ACTIVE".equals(session.get("state"))) && now.isBefore(r.startsAt()))
+            throw beforeStart(r.startsAt(),now);
         String sid,state;
         if (session.isEmpty()){
-            Instant now=Instant.now();
-            if(now.isBefore(r.startsAt())) throw fail(409,"BOARDING_TOO_EARLY");
             if(!now.isBefore(r.confirmedEndAt())) throw fail(409,"RESERVATION_EXPIRED");
-            if (!first(db,"SELECT old_session_id FROM session_replacement WHERE new_reservation_id=? AND status<>'APPROVED' FOR UPDATE",r.id()).isEmpty())
+            if(!first(db,"SELECT old_session_id FROM session_replacement WHERE new_reservation_id=? AND status<>'APPROVED' FOR UPDATE",r.id()).isEmpty())
                 throw fail(409,"REPLACEMENT_PENDING");
             if (!first(db,"SELECT id FROM rental_session WHERE occupied_vehicle=? OR occupied_account=? FOR UPDATE",r.vehicleId(),r.accountId()).isEmpty())
                 throw fail(409,"PREVIOUS_SESSION_REQUIRES_CLEANUP");
@@ -209,6 +253,10 @@ class ChallengeService {
             var booking=bookings.refresh(bookings.lockAllocation(string(row,"reservation_id")));
             if(!booking.accountId().equals(row.get("account_id")) || !booking.vehicleId().equals(row.get("vehicle_id"))
                     || !"CONFIRMED".equals(booking.status())) throw fail(403,"RECOVERY_REQUIRES_REAUTHENTICATION");
+            Instant now=Instant.now();
+            // Pending uploads and cleanup remain reachable; only ACTIVE use needs the start boundary.
+            if("ACTIVE".equals(row.get("state")) && now.isBefore(booking.startsAt()))
+                throw beforeStart(booking.startsAt(),now);
         } catch(ApiError e) {
             db.update("DELETE FROM auth_token WHERE session_id=?",actor.id());
             throw e;

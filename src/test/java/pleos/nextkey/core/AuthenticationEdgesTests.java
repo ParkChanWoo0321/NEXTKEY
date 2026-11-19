@@ -103,10 +103,11 @@ class AuthenticationEdgesTests {
         db.update("UPDATE auth_challenge SET second_expires_at=UTC_TIMESTAMP(6)-INTERVAL 1 SECOND WHERE id=?",expired);
         rejects("SECOND_FACTOR_EXPIRED",()->challenges.verify(expired,customer,otp));
         String limited=factor(rid);
-        for(int i=0;i<4;i++) rejects("SECOND_FACTOR_INVALID",()->challenges.verify(limited,customer,"wrong-code"));
+        for(int i=0;i<2;i++) rejects("SECOND_FACTOR_INVALID",()->challenges.verify(limited,customer,"wrong-code"));
         rejects("SECOND_FACTOR_ATTEMPT_LIMIT",()->challenges.verify(limited,customer,"wrong-code"));
-        String another=factor(rid);
-        rejects("SECOND_FACTOR_ATTEMPT_LIMIT",()->challenges.verify(another,customer,otp));
+        var another=challenges.create(device,"QR",Map.of());
+        rejects("SECOND_FACTOR_ATTEMPT_LIMIT",()->challenges.qr((String)another.get("id"),customer,
+                (String)another.get("qrToken"),rid));
         assertEquals(0,db.queryForObject("SELECT COUNT(*) FROM rental_session WHERE account_id=?",Integer.class,customer.id()));
     }
     @Test void productionDeniesSeededCredentialAndItsAlreadyIssuedBearer(){
