@@ -1,6 +1,7 @@
 package pleos.nextkey.common;
 
 import java.util.Map;
+import java.util.LinkedHashMap;
 import org.springframework.dao.ConcurrencyFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.ResponseEntity;
@@ -12,7 +13,14 @@ import org.springframework.web.multipart.MaxUploadSizeExceededException;
 @RestControllerAdvice
 class ApiErrors {
     @ExceptionHandler(ApiError.class)
-    ResponseEntity<?> domain(ApiError ex) { return error(ex.status(), ex.code()); }
+    ResponseEntity<?> domain(ApiError ex) {
+        var body=new LinkedHashMap<String,Object>(ex.details());
+        body.put("code",ex.code());
+        var response=ResponseEntity.status(ex.status());
+        if(ex.status()==429 && ex.details().get("retryAfterSeconds") instanceof Number seconds)
+            response.header("Retry-After",Long.toString(Math.max(1,seconds.longValue())));
+        return response.body(body);
+    }
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)
     ResponseEntity<?> tooLarge() { return error(413, "FILE_TOO_LARGE"); }
