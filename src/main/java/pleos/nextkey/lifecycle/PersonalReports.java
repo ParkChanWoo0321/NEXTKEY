@@ -1,5 +1,6 @@
 package pleos.nextkey.lifecycle;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
@@ -21,6 +22,7 @@ class PersonalReports {
     private final TransactionTemplate transactions;
     private final TransactionTemplate snapshotRead;
     private final RentalRecords records;
+    private DevelopmentReportFaults developmentFaults;
 
     PersonalReports(JdbcTemplate db, TransactionTemplate transactions,RentalRecords records) {
         this.db=db;
@@ -30,6 +32,9 @@ class PersonalReports {
         snapshotRead.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
         snapshotRead.setReadOnly(true);
     }
+
+    @Autowired(required=false)
+    void developmentFaults(DevelopmentReportFaults faults) { developmentFaults=faults; }
 
     @Scheduled(fixedDelayString="${nextkey.report.interval-ms:5000}")
     public void pending() {
@@ -60,6 +65,8 @@ class PersonalReports {
         try {
             var snapshot=snapshotRead.execute(tx->assemble(id,onlyPending));
             if (snapshot==null) return Map.of();
+            if (snapshot.payload()!=null && developmentFaults!=null && developmentFaults.block(id,explicitRetry))
+                throw new ApiError(503,"REPORT_GENERATION_FAILED");
             return transactions.execute(tx->publish(id,snapshot));
         } catch (RuntimeException failure) {
             // Keep the last published document readable when only a refresh failed.
