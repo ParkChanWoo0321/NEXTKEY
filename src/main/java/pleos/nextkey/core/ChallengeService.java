@@ -4,6 +4,7 @@ import java.time.Instant;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -22,14 +23,16 @@ class ChallengeService {
     private final BookingService bookings;
     private final Credentials credentials;
     private final IdentityFactor factor;
+    private final Optional<DevelopmentOverdueDeadline> demoDeadline;
     private final long challengeSeconds;
     private final long factorSeconds;
     private final boolean allowDemo;
     ChallengeService(JdbcTemplate db,BookingService bookings,Credentials credentials,IdentityFactor factor,
             @Value("${nextkey.auth.challenge-seconds:60}") long challengeSeconds,
             @Value("${nextkey.auth.factor-seconds:120}") long factorSeconds,
-            org.springframework.core.env.Environment env) {
+            org.springframework.core.env.Environment env,Optional<DevelopmentOverdueDeadline> demoDeadline) {
         this.db=db;this.bookings=bookings;this.credentials=credentials;this.factor=factor;
+        this.demoDeadline=demoDeadline;
         if (challengeSeconds<1 || challengeSeconds>900 || factorSeconds<1 || factorSeconds>900)
             throw new IllegalArgumentException("Invalid challenge lifetime");
         this.challengeSeconds=challengeSeconds;this.factorSeconds=factorSeconds;
@@ -232,6 +235,7 @@ class ChallengeService {
         if (!"VERIFIED".equals(c.get("status"))) throw fail(409,"CHALLENGE_NOT_CLAIMABLE");
         if (!instant(c.get("expires_at")).isAfter(Instant.now())) throw fail(410,"CLAIM_EXPIRED");
         String sid=string(c,"session_id");
+        demoDeadline.ifPresent(deadline->deadline.onClaim(actor.id(),string(c,"reservation_id"),sid));
         var session=first(db,"SELECT cleanup_state FROM rental_session WHERE id=? FOR UPDATE",sid);
         if ("COMPLETE".equals(session.get("cleanup_state"))) throw fail(409,"SESSION_ALREADY_CLEANED");
         String token=credentials.issue(actor.id(),sid);
