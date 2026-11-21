@@ -17,6 +17,8 @@ import static pleos.nextkey.core.CoreData.*;
 
 @Service
 class ChallengeService {
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private DevelopmentReviewHandoff reviewHandoff;
     private static final int FACTOR_ATTEMPT_LIMIT=3;
     private static final long FACTOR_LOCK_SECONDS=15;
     private final JdbcTemplate db;
@@ -187,7 +189,9 @@ class ChallengeService {
             throw new ApiError(401,"SECOND_FACTOR_INVALID",Map.of("attemptLimit",FACTOR_ATTEMPT_LIMIT,
                     "remainingAttempts",FACTOR_ATTEMPT_LIMIT-global,"lockSeconds",FACTOR_LOCK_SECONDS));
         }
-        var r=bookings.lookup(string(c,"reservation_id"),true);
+        String reservation = string(c,"reservation_id");
+        if (reviewHandoff != null) reservation = reviewHandoff.resolve(reservation, account, string(c,"vehicle_id"));
+        var r=bookings.lookup(reservation,true);
         if (!account.equals(r.accountId())) throw fail(403,"RESERVATION_FORBIDDEN");
         if (!r.vehicleId().equals(c.get("vehicle_id"))) throw fail(409,"VEHICLE_MISMATCH");
         r=bookings.refresh(r);
@@ -223,7 +227,7 @@ class ChallengeService {
             sid=string(session,"id");state=string(session,"state");
         }
         db.update("UPDATE account SET factor_attempts=0,factor_blocked_until=NULL WHERE id=?",account);
-        db.update("UPDATE auth_challenge SET status='VERIFIED',session_id=?,expires_at=? WHERE id=?",sid,sql(Instant.now().plusSeconds(challengeSeconds)),id);
+        db.update("UPDATE auth_challenge SET status='VERIFIED',reservation_id=?,session_id=?,expires_at=? WHERE id=?",r.id(),sid,sql(Instant.now().plusSeconds(challengeSeconds)),id);
         return Map.of("sessionId",sid,"state",state,"scope","APP_SESSION");
     }
 
