@@ -34,30 +34,58 @@ class DemoData implements SmartInitializingSingleton {
     @Override @Transactional
     public void afterSingletonsInstantiated() {
         boolean cloudRun = env.containsProperty("K_SERVICE");
+        boolean simpleCustomerLogin = env.getProperty("NEXTKEY_DEV_SIMPLE_CUSTOMER_LOGIN", Boolean.class, false);
         Map<String, String> passwords = new HashMap<>();
         for (Fixture fixture : FIXTURES) {
-            String variable = cloudRun ? fixture.passwordVariable() : "NEXTKEY_DEV_PASSWORD";
+            boolean simpleCustomer = simpleCustomerLogin && "demo-customer".equals(fixture.id());
+            String variable = simpleCustomer ? "NEXTKEY_DEV_SIMPLE_CUSTOMER_PASSWORD"
+                    : cloudRun ? fixture.passwordVariable() : "NEXTKEY_DEV_PASSWORD";
             String password = env.getProperty(variable);
-            if (password == null || password.length() < 12 || password.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 72) {
-                throw new IllegalStateException(variable + " requires at least 12 characters and at most 72 UTF-8 bytes");
+            if (password == null || password.isBlank() || (!simpleCustomer && password.length() < 12)
+                    || password.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 72) {
+                throw new IllegalStateException("Invalid development credential configured in " + variable);
             }
             passwords.put(fixture.id(), password);
         }
         if (cloudRun && new HashSet<>(passwords.values()).size() != FIXTURES.size()) {
             throw new IllegalStateException("Cloud Run development accounts require distinct passwords");
         }
+        Map<String, Map<String,Object>> existingAccounts = new HashMap<>();
         for (Fixture fixture : FIXTURES) {
             String key=fixture.id();
             String password = passwords.get(key);
-            var existing=first(db,"SELECT id,is_demo,role,username,password_hash FROM account WHERE id=? OR username=? FOR UPDATE",key,key);
-            if(existing.isEmpty()){
-                db.update("INSERT INTO account(id,role,username,password_hash,is_demo) VALUES (?,?,?,?,TRUE)",
-                        key,fixture.role(),key,encoder.encode(password));
-            } else if(!Boolean.TRUE.equals(existing.get("is_demo")) || !key.equals(existing.get("id"))
-                    || !key.equals(existing.get("username")) || !fixture.role().equals(existing.get("role"))){
+            boolean simpleCustomer = simpleCustomerLogin && "demo-customer".equals(key);
+            String username = simpleCustomer ? "test" : key;
+            var matches = db.queryForList("SELECT id,is_demo,role,username,password_hash FROM account WHERE id=? OR username=? FOR UPDATE",key,username);
+            if (matches.size() > 1) {
                 throw new IllegalStateException("Development fixture identifier conflicts with an existing account");
-            } else if (cloudRun && !encoder.matches(password, (String) existing.get("password_hash"))) {
+            }
+            var existing = matches.isEmpty() ? Map.<String,Object>of() : matches.get(0);
+            existingAccounts.put(key,existing);
+            if (existing.isEmpty()) continue;
+            boolean acceptedUsername = key.equals(existing.get("username"))
+                    || (simpleCustomer && username.equals(existing.get("username")));
+            if (!Boolean.TRUE.equals(existing.get("is_demo")) || !key.equals(existing.get("id"))
+                    || !acceptedUsername || !fixture.role().equals(existing.get("role"))) {
+                throw new IllegalStateException("Development fixture identifier conflicts with an existing account");
+            }
+            if (cloudRun && !simpleCustomer && !encoder.matches(password, (String) existing.get("password_hash"))) {
                 throw new IllegalStateException("Stored credential differs from the configured Cloud Run credential for " + key);
+            }
+        }
+        for (Fixture fixture : FIXTURES) {
+            String key=fixture.id();
+            String password=passwords.get(key);
+            boolean simpleCustomer=simpleCustomerLogin && "demo-customer".equals(key);
+            String username=simpleCustomer ? "test" : key;
+            var existing=existingAccounts.get(key);
+            if (existing.isEmpty()) {
+                db.update("INSERT INTO account(id,role,username,password_hash,is_demo) VALUES (?,?,?,?,TRUE)",
+                        key,fixture.role(),username,encoder.encode(password));
+            } else if (simpleCustomer && (!username.equals(existing.get("username"))
+                    || !encoder.matches(password,(String)existing.get("password_hash")))) {
+                db.update("UPDATE account SET username=?,password_hash=?,failed_attempts=0,blocked_until=NULL WHERE id=?",
+                        username,encoder.encode(password),key);
             }
         }
         for (String id: new String[]{"demo-car","demo-car-2"}) {
